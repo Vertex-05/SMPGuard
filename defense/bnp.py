@@ -131,6 +131,19 @@ def bnp_defense(net, u, trainloader, args):
 			m.collect_stats_bd = False
 	with torch.no_grad():
 		net(mixture_data)
+
+	# Save reference-data statistics before the next forward pass.
+	# Otherwise, bd_data may overwrite batch_mean and batch_var.
+	bn_clean_stats = {}
+
+	for name, m in net.named_modules():
+		if isinstance(m, nn.BatchNorm2d):
+			bn_clean_stats[name] = (
+				m.batch_mean.detach().clone(),
+				m.batch_var.detach().clone(),
+			)	
+
+
 	for m in net.modules():
 		if isinstance(m, nn.LayerNorm):
 			m.collect_stats_bd = True
@@ -139,12 +152,11 @@ def bnp_defense(net, u, trainloader, args):
 		net(bd_data)
 		for name, m in net.named_modules():
 			if isinstance(m, nn.BatchNorm2d):
+				mean_1, var_1 = bn_clean_stats[name]   # ← 干净参考统计
+				mean_2 = m.running_mean                 # ← BN 训练统计
 				var_2 = m.running_var
-				var_1 = m.batch_var
-				mean_2 = m.running_mean
-				mean_1 = m.batch_mean
 				kl_div = (var_2/var_1).log() + (var_1+(mean_1-mean_2).pow(2))/(2*var_2) - 1/2
-				index = (kl_div>kl_div.mean() + u*kl_div.std())
+				index = (kl_div > kl_div.mean() + u * kl_div.std())
 
 				params[name+'.weight'][index] = 0
 				params[name+'.bias'][index] = 0
