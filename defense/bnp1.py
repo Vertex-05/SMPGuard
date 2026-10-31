@@ -116,6 +116,29 @@ def batch_entropy(x, step_size=0.1):
 		entropy += - p * p.log().nan_to_num(0)
 	return entropy
 
+def adaptive_mad_threshold(kl_div, k=2.0, eps=1e-8):
+    """
+    Adaptive-A: Median + k * MAD
+
+    kl_div: 当前归一化层所有通道的 KL 分数
+    k: 控制阈值严格程度的参数
+    """
+    scores = kl_div.detach().reshape(-1)
+
+    median = scores.median()
+    mad = (scores - median).abs().median()
+
+    # 将 MAD 转换为与标准差可比的稳健尺度
+    robust_scale = 1.4826 * mad
+
+    # 防止 MAD 为 0 时阈值完全退化
+    robust_scale = robust_scale.clamp_min(eps)
+
+    threshold = median + k * robust_scale
+
+    return threshold
+
+
 def bnp_defense(net, u, trainloader, args):
 	clean_data_loader = trainloader['clean_train']
 	bd_data_loader = trainloader['bd_train']
@@ -155,22 +178,75 @@ def bnp_defense(net, u, trainloader, args):
 				mean_1, var_1 = bn_clean_stats[name]   # ← 干净参考统计
 				mean_2 = m.running_mean                 # ← BN 训练统计
 				var_2 = m.running_var
-				kl_div = (var_2/var_1).log() + (var_1+(mean_1-mean_2).pow(2))/(2*var_2) - 1/2
-				index = (kl_div > kl_div.mean() + u * kl_div.std())
 
-				params[name+'.weight'][index] = 0
-				params[name+'.bias'][index] = 0
+				# Correct Gaussian KL divergence
+				eps = 1e-8
+
+				var_1 = var_1.clamp_min(eps)
+				var_2 = var_2.clamp_min(eps)
+				kl_div = (var_2/var_1).log() + (var_1+(mean_1-mean_2).pow(2))/(2*var_2) - 1/2
+
+				# Adaptive-A: Median + k * MAD
+				threshold = adaptive_mad_threshold(kl_div, k=u)
+
+				index = kl_div > threshold
+
+				# Record pruning statistics
+				pruned_channels = int(index.sum().item())
+				total_channels = int(index.numel())
+				prune_ratio = pruned_channels / max(total_channels, 1)
+
+				print(
+					f"[Adaptive-A] Layer: {name}, "
+					f"Threshold: {threshold.item():.6f}, "
+					f"Pruned: {pruned_channels}/{total_channels}, "
+					f"Ratio: {prune_ratio:.2%}"
+				)
+
+				params[name + '.weight'][index] = 0
+				params[name + '.bias'][index] = 0
+
+				# kl_div = (var_2/var_1).log() + (var_1+(mean_1-mean_2).pow(2))/(2*var_2) - 1/2
+				# index = (kl_div > kl_div.mean() + u * kl_div.std())
+
+				# params[name+'.weight'][index] = 0
+				# params[name+'.bias'][index] = 0
 			elif isinstance(m, nn.LayerNorm):
 				# We use layer norm to subsitute batch norm in convnext_model and vit_model
 				var_2 = m.batch_var_bd
 				var_1 = m.batch_var_clean
 				mean_2 = m.batch_mean_bd
 				mean_1 = m.batch_mean_clean
-				kl_div = 0.5 * torch.log(var_2 / var_1) + (var_1+(mean_1-mean_2).pow(2))/(2*var_2) - 1/2
-				index = (kl_div>kl_div.mean() + u*kl_div.std())
 
-				params[name+'.weight'][index] = 0
-				params[name+'.bias'][index] = 0
+				eps = 1e-8
+
+				var_1 = var_1.clamp_min(eps)
+				var_2 = var_2.clamp_min(eps)
+				kl_div = 0.5 * torch.log(var_2 / var_1) + (var_1+(mean_1-mean_2).pow(2))/(2*var_2) - 1/2
+				# Adaptive-A: Median + k * MAD
+				threshold = adaptive_mad_threshold(kl_div, k=u)
+
+				index = kl_div > threshold
+
+				pruned_channels = int(index.sum().item())
+				total_channels = int(index.numel())
+				prune_ratio = pruned_channels / max(total_channels, 1)
+
+				print(
+					f"[Adaptive-A] Layer: {name}, "
+					f"Threshold: {threshold.item():.6f}, "
+					f"Pruned: {pruned_channels}/{total_channels}, "
+					f"Ratio: {prune_ratio:.2%}"
+				)
+
+				params[name + '.weight'][index] = 0
+				params[name + '.bias'][index] = 0
+
+				# kl_div = 0.5 * torch.log(var_2 / var_1) + (var_1+(mean_1-mean_2).pow(2))/(2*var_2) - 1/2
+				# index = (kl_div>kl_div.mean() + u*kl_div.std())
+
+				# params[name+'.weight'][index] = 0
+				# params[name+'.bias'][index] = 0
 
 	net.load_state_dict(params)
 
