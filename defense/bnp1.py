@@ -138,6 +138,40 @@ def adaptive_mad_threshold(kl_div, k=2.0, eps=1e-8):
 
     return threshold
 
+def evaluate_clean_acc(model, dataloader, criterion, device):
+    """
+    Evaluate clean accuracy and loss only.
+
+    This function does NOT access the backdoor test set.
+    """
+
+    model.eval()
+    model.to(device)
+
+    total_correct = 0
+    total_samples = 0
+    total_loss = 0.0
+
+    criterion = criterion.to(device)
+
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch[0].to(device)
+            labels = batch[1].to(device)
+
+            outputs = model(images)
+            loss = criterion(outputs, labels.long())
+
+            predictions = outputs.argmax(dim=1)
+
+            total_correct += predictions.eq(labels).sum().item()
+            total_samples += labels.size(0)
+            total_loss += loss.item() * labels.size(0)
+
+    clean_acc = total_correct / max(total_samples, 1)
+    clean_loss = total_loss / max(total_samples, 1)
+
+    return clean_acc, clean_loss
 
 def bnp_defense(net, u, trainloader, args):
 	clean_data_loader = trainloader['clean_train']
@@ -196,7 +230,7 @@ def bnp_defense(net, u, trainloader, args):
 				total_channels = int(index.numel())
 				prune_ratio = pruned_channels / max(total_channels, 1)
 
-				print(
+				logging.info(
 					f"[Adaptive-A] Layer: {name}, "
 					f"Threshold: {threshold.item():.6f}, "
 					f"Pruned: {pruned_channels}/{total_channels}, "
@@ -232,7 +266,7 @@ def bnp_defense(net, u, trainloader, args):
 				total_channels = int(index.numel())
 				prune_ratio = pruned_channels / max(total_channels, 1)
 
-				print(
+				logging.info(
 					f"[Adaptive-A] Layer: {name}, "
 					f"Threshold: {threshold.item():.6f}, "
 					f"Pruned: {pruned_channels}/{total_channels}, "
@@ -355,10 +389,16 @@ class bnp(defense):
 		parser.add_argument('--yaml_path', type=str, default="./config/defense/bnp/config.yaml", help='the path of yaml')
 
 		#set the parameter for the bnp defense
-		parser.add_argument('--u', type=float, help='u in the bnp defense')
-		parser.add_argument('--u_min', type=float, help='the default minimum value of u')
-		parser.add_argument('--u_max', type=float, help='the default maximum value of u')
-		parser.add_argument('--u_num', type=float, help='the default number of u')
+		# Adaptive-A search
+		parser.add_argument('--u', type=float, default=2.5,	help='fallback/default u')
+		parser.add_argument('--u_min', type=float, default=1.0,	help='minimum u for search')
+		parser.add_argument('--u_max', type=float, default=5.0, help='maximum u for search')
+		parser.add_argument('--u_num', type=int, default=41, help='number of candidate u values')
+
+		# ACC-constrained global search
+		parser.add_argument('--acc_drop_tolerance', type=float, default=0.015, help='maximum allowed ACC drop from clean validation baseline')
+		parser.add_argument('--val_ratio', type=float, default=0.2,	help='ratio of clean data used for validation')
+
 		parser.add_argument('--ratio', type=float, help='the ratio of clean data loader')
 		parser.add_argument('--index', type=str, help='index of clean data')
 
@@ -566,180 +606,300 @@ class bnp(defense):
 		trainloader_clean = data_loader
 		trainloader_all['clean_train'] = trainloader_clean
 
-		# train_tran = get_transform(self.args.dataset, *([self.args.input_height,self.args.input_width]) , train = True)
-		# clean_dataset = prepro_cls_DatasetBD_v2(self.result['clean_train'].wrapped_dataset)
-		# data_all_length = len(clean_dataset)
-		# ran_idx = choose_index(self.args, data_all_length) 
-		# log_index = self.args.log + 'index.txt'
-		# np.savetxt(log_index, ran_idx, fmt='%d')
-		# clean_dataset.subset(ran_idx)
-		# data_set_without_tran = clean_dataset
-		# data_set_o = self.result['clean_train']
-		# data_set_o.wrapped_dataset = data_set_without_tran
-		# data_set_o.wrap_img_transform = train_tran
 
-		# data_loader = torch.utils.data.DataLoader(data_set_o, batch_size=self.args.batch_size, num_workers=self.args.num_workers, shuffle=True, pin_memory=args.pin_memory)
-		# trainloader_clean = data_loader
-		# trainloader_all['clean_train'] = trainloader_clean
+		# ==========================================
+		# Prepare clean validation and final test sets
+		# ==========================================
 
+		test_tran = get_transform(self.args.dataset, self.args.input_height, self.args.input_width,	train=False)
 
-		test_tran = get_transform(self.args.dataset, *([self.args.input_height,self.args.input_width]) , train = False)
+		# Backdoor test set: only used for final evaluation
 		data_bd_testset = self.result['bd_test']
 		data_bd_testset.wrap_img_transform = test_tran
-		data_bd_loader = torch.utils.data.DataLoader(data_bd_testset, batch_size=self.args.batch_size, num_workers=self.args.num_workers,drop_last=False,pin_memory=args.pin_memory)
 
-		data_clean_testset = self.result['clean_test']
-		data_clean_testset.wrap_img_transform = test_tran
-		data_clean_loader = torch.utils.data.DataLoader(data_clean_testset, batch_size=self.args.batch_size, num_workers=self.args.num_workers,drop_last=False,pin_memory=args.pin_memory)
+		data_bd_loader = torch.utils.data.DataLoader(data_bd_testset, batch_size=self.args.batch_size, num_workers=self.args.num_workers, drop_last=False,	pin_memory=self.args.pin_memory)
 
+		# Clean data: split into validation and final test
+		data_clean_all = self.result['clean_test']
+		data_clean_all.wrap_img_transform = test_tran
+
+		total_size = len(data_clean_all)
+		val_size = int(total_size * self.args.val_ratio)
+		test_size = total_size - val_size
+
+		if val_size <= 0 or test_size <= 0:
+			raise ValueError("Invalid clean validation/test split.")
+
+		generator = torch.Generator()
+		generator.manual_seed(self.args.random_seed)
+		clean_val_subset, clean_test_subset = torch.utils.data.random_split(data_clean_all,	[val_size, test_size],	generator=generator)
+		clean_val_loader = torch.utils.data.DataLoader(clean_val_subset, batch_size=self.args.batch_size, shuffle=False, num_workers=self.args.num_workers,	pin_memory=self.args.pin_memory)
+		data_clean_loader = torch.utils.data.DataLoader(clean_test_subset,batch_size=self.args.batch_size,shuffle=False,num_workers=self.args.num_workers,pin_memory=self.args.pin_memory)
+
+		print(f"Clean validation samples: {val_size}")
+		print(f"Clean final test samples: {test_size}")
 		
-		default_u = np.linspace(self.args.u_min, self.args.u_max, self.args.u_num)
-		
-		agg_all = Metric_Aggregator()
-		clean_test_loss_list = []
-		bd_test_loss_list = []
-		test_acc_list = []
-		test_asr_list = []
-		test_ra_list = []
+		# ==========================================
+		# ACC-Constrained Adaptive-A Global Search
+		# ==========================================
+
+		default_u = np.linspace(
+			self.args.u_min,
+			self.args.u_max,
+			self.args.u_num
+		)
+
+		# Sort candidate u values from small to large
+		default_u = np.sort(default_u)
+
+		# ------------------------------------------
+		# 1. Evaluate the original unpruned model
+		# ------------------------------------------
+
+		baseline_model = copy.deepcopy(net)
+
+		baseline_acc, baseline_loss = evaluate_clean_acc(
+			baseline_model,
+			clean_val_loader,
+			criterion,
+			self.args.device
+		)
+
+		acc_min = baseline_acc - self.args.acc_drop_tolerance
+
+		print("\n========== ACC-Constrained Search ==========")
+		print(f"Baseline Clean ACC: {baseline_acc:.4%}")
+		print(f"Baseline Clean Loss: {baseline_loss:.6f}")
+		print(f"Allowed ACC drop: {self.args.acc_drop_tolerance:.4%}")
+		print(f"Minimum required ACC: {acc_min:.4%}")
+
+		# ------------------------------------------
+		# 2. Search for the smallest feasible u
+		# ------------------------------------------
+
+		search_results = []
+
+		selected_u = None
+		selected_model = None
+
+		# 准备测试集的 dataloader 字典
+		test_dataloader_dict = {
+			"clean_test_dataloader": data_clean_loader,
+			"bd_test_dataloader": data_bd_loader
+		}
+
 		for u in default_u:
+
+			print(f"\n========== Testing u = {u:.4f} ==========")
+
+			# Every candidate starts from the same original model
 			model_copy = copy.deepcopy(net)
 			model_copy.eval()
-			bnp_defense(model_copy, u, trainloader_all, args)
-			# model.eval()
-			model_copy.eval()
-			test_dataloader_dict = {}
-			test_dataloader_dict["clean_test_dataloader"] = data_clean_loader
-			test_dataloader_dict["bd_test_dataloader"] = data_bd_loader
 
+			# Hard pruning using Adaptive-A
+			bnp_defense(
+				model_copy,
+				float(u),
+				trainloader_all,
+				self.args
+			)
+
+			# 1. Evaluate clean validation performance (用于判断 Feasible)
+			val_acc, val_loss = evaluate_clean_acc(
+				model_copy,
+				clean_val_loader,
+				criterion,
+				self.args.device
+			)
+
+			# Check ACC constraint
+			feasible = val_acc >= acc_min
+
+			# 2. Evaluate test set performance (用于记录和画图)
+			# 为了使用 trainer，先包装一下
 			self.set_trainer(model_copy)
 			self.trainer.set_with_dataloader(
-				### the train_dataload has nothing to do with the backdoor defense
-				train_dataloader = data_bd_loader,
-				test_dataloader_dict = test_dataloader_dict,
-
-				criterion = criterion,
-				optimizer = None,
-				scheduler = None,
-				device = self.args.device,
-				amp = self.args.amp,
-
-				frequency_save = self.args.frequency_save,
-				save_folder_path = self.args.save_path,
-				save_prefix = 'bnp',
-
-				prefetch = self.args.prefetch,
-				prefetch_transform_attr_name = "ori_image_transform_in_loading",
-				non_blocking = self.args.non_blocking,
-
-	
-				)
-
-			clean_test_loss_avg_over_batch, \
-					bd_test_loss_avg_over_batch, \
-					test_acc, \
-					test_asr, \
-					test_ra = self.trainer.test_current_model(
-				test_dataloader_dict, self.args.device,
+				train_dataloader=trainloader_backdoor,
+				test_dataloader_dict=test_dataloader_dict,
+				criterion=criterion,
+				optimizer=None,
+				scheduler=None,
+				device=self.args.device,
+				amp=self.args.amp,
+				frequency_save=self.args.frequency_save,
+				save_folder_path=self.args.save_path,
+				save_prefix='bnp',
+				prefetch=self.args.prefetch,
+				prefetch_transform_attr_name="ori_image_transform_in_loading",
+				non_blocking=self.args.non_blocking,
 			)
-			clean_test_loss_list.append(clean_test_loss_avg_over_batch)
-			bd_test_loss_list.append(bd_test_loss_avg_over_batch)
-			test_acc_list.append(test_acc)
-			test_asr_list.append(test_asr)
-			test_ra_list.append(test_ra)
-			agg_all({
-				"u": u,
-				"clean_test_loss_avg_over_batch": clean_test_loss_avg_over_batch,
-				"bd_test_loss_avg_over_batch": bd_test_loss_avg_over_batch,
+			
+			clean_test_loss, bd_test_loss, test_acc, test_asr, test_ra = self.trainer.test_current_model(
+				test_dataloader_dict, self.args.device
+			)
+
+			search_results.append({
+				"u": float(u),
+				"clean_val_acc": val_acc,
+				"clean_val_loss": val_loss,
 				"test_acc": test_acc,
 				"test_asr": test_asr,
 				"test_ra": test_ra,
+				"acc_min": acc_min,
+				"feasible": feasible
 			})
 
-			general_plot_for_epoch(
-				{
-					"Test C-Acc": test_acc_list,
-					"Test ASR": test_asr_list,
-					"Test RA": test_ra_list,
-				},
-				save_path=f"{args.save_path}u_step_acc_like_metric_plots.png",
-				ylabel="percentage",
+			print(f"Validation ACC: {val_acc:.4%} | Feasible: {feasible}")
+			
+			# ==========================================
+			# 这里是你要求的：把每个 u 的【测试集】指标打进日志！
+			# ==========================================
+			logging.info(
+				f"\n========== BNP Eval (Test Set): u={u:.4f} ==========\n"
+				f"Clean Loss: {clean_test_loss:.6f} | "
+				f"BD Loss: {bd_test_loss:.6f} | "
+				f"ACC: {test_acc:.4%} | "
+				f"ASR: {test_asr:.4%} | "
+				f"RA: {test_ra:.4%} | "
+				f"Val ACC: {val_acc:.4%} | "
+				f"Feasible: {feasible}"
 			)
 
-			general_plot_for_epoch(
-				{
-					"Test Clean Loss": clean_test_loss_list,
-					"Test Backdoor Loss": bd_test_loss_list,
-				},
-				save_path=f"{args.save_path}u_step_loss_metric_plots.png",
-				ylabel="percentage",
+			# Select the first feasible u.
+			if feasible and selected_model is None:
+				selected_u = float(u)
+				selected_model = copy.deepcopy(model_copy)
+
+		# ------------------------------------------
+		# 3. Handle the case where no candidate works
+		# ------------------------------------------
+
+		if selected_model is None:
+
+			print("\n[Warning] No candidate u satisfies the ACC constraint.")
+			print("Fallback: use the original unpruned model.")
+
+			selected_u = None
+			selected_model = copy.deepcopy(net)
+
+		else:
+
+			print("\n========== Search Result ==========")
+			print(f"Selected u: {selected_u:.4f}")
+
+			selected_acc, selected_loss = evaluate_clean_acc(
+				selected_model,
+				clean_val_loader,
+				criterion,
+				self.args.device
 			)
 
-			general_plot_for_epoch(
-				{
-					"u": default_u,
-				},
-				save_path=f"{args.save_path}u_step_plots.png",
-				ylabel="percentage",
-			)
+			print(f"Selected Validation ACC: {selected_acc:.4%}")
+			print(f"Selected Validation Loss: {selected_loss:.6f}")
 
-			agg_all.to_dataframe().to_csv(f"{args.save_path}u_step_df.csv")
+		# ------------------------------------------
+		# 4. Save search results
+		# ------------------------------------------
+
+		import pandas as pd
+
+		search_df = pd.DataFrame(search_results)
+
+		search_df.to_csv(
+			f"{self.args.save_path}acc_constrained_search.csv",
+			index=False
+		)
+
+		print(
+			f"Search results saved to: "
+			f"{self.args.save_path}acc_constrained_search.csv"
+		)
+
+		# ==========================================
+		# Final evaluation using selected model
+		# ==========================================
 
 		agg = Metric_Aggregator()
-		bnp_defense(net, self.args.u, trainloader_all, args)
 
-		test_dataloader_dict = {}
-		test_dataloader_dict["clean_test_dataloader"] = data_clean_loader
-		test_dataloader_dict["bd_test_dataloader"] = data_bd_loader
-		
-		model = generate_cls_model(self.args.model,self.args.num_classes)
-		model.load_state_dict(net.state_dict())
+		# Use the selected model directly.
+		# Do NOT apply BNP again.
+		selected_model.eval()
+
+		# Convert MBNS model to the standard model structure
+		model = generate_cls_model(
+			self.args.model,
+			self.args.num_classes
+		)
+
+		model.load_state_dict(selected_model.state_dict())
+		model.to(self.args.device)
+
 		self.set_trainer(model)
 
 		self.trainer.set_with_dataloader(
-			train_dataloader = trainloader_backdoor,
-			test_dataloader_dict = test_dataloader_dict,
+			train_dataloader=trainloader_backdoor,
+			test_dataloader_dict=test_dataloader_dict,
 
-			criterion = criterion,
-			optimizer = None,
-			scheduler = None,
-			device = self.args.device,
-			amp = self.args.amp,
+			criterion=criterion,
+			optimizer=None,
+			scheduler=None,
+			device=self.args.device,
+			amp=self.args.amp,
 
-			frequency_save = self.args.frequency_save,
-			save_folder_path = self.args.save_path,
-			save_prefix = 'bnp',
+			frequency_save=self.args.frequency_save,
+			save_folder_path=self.args.save_path,
+			save_prefix='bnp',
 
-			prefetch = self.args.prefetch,
-			prefetch_transform_attr_name = "ori_image_transform_in_loading",
-			non_blocking = self.args.non_blocking,
-
+			prefetch=self.args.prefetch,
+			prefetch_transform_attr_name="ori_image_transform_in_loading",
+			non_blocking=self.args.non_blocking,
 		)
 
+		# Final evaluation
 		clean_test_loss_avg_over_batch, \
-				bd_test_loss_avg_over_batch, \
-				test_acc, \
-				test_asr, \
-				test_ra = self.trainer.test_current_model(
-			test_dataloader_dict, self.args.device,
+		bd_test_loss_avg_over_batch, \
+		test_acc, \
+		test_asr, \
+		test_ra = self.trainer.test_current_model(
+			test_dataloader_dict,
+			self.args.device
 		)
-		agg({
-				"u": self.args.u,
-				"clean_test_loss_avg_over_batch": clean_test_loss_avg_over_batch,
-				"bd_test_loss_avg_over_batch": bd_test_loss_avg_over_batch,
-				"test_acc": test_acc,
-				"test_asr": test_asr,
-				"test_ra": test_ra,
-			})
-		agg.to_dataframe().to_csv(f"{args.save_path}bnp_df_summary.csv")
 
+		# 这里修复了原来的 bug，将 u 改成了 selected_u
+		logging.info(
+			f"\n========== Final Selected Model: u={selected_u if selected_u is not None else -1} ==========\n"
+			f"Clean ACC: {test_acc:.4%} | "
+			f"ASR: {test_asr:.4%} | "
+			f"RA: {test_ra:.4%} | "
+			f"Clean Loss: {clean_test_loss_avg_over_batch:.6f} | "
+			f"BD Loss: {bd_test_loss_avg_over_batch:.6f}"
+		)		
+
+		agg({
+			"selected_u": selected_u if selected_u is not None else -1,
+			"clean_test_loss_avg_over_batch": clean_test_loss_avg_over_batch,
+			"bd_test_loss_avg_over_batch": bd_test_loss_avg_over_batch,
+			"test_acc": test_acc,
+			"test_asr": test_asr,
+			"test_ra": test_ra,
+		})
+
+		agg.to_dataframe().to_csv(
+			f"{self.args.save_path}bnp_df_summary.csv",
+			index=False
+		)
+
+		# Save selected model
 		result = {}
 		result['model'] = model
+
 		save_defense_result(
-			model_name=args.model,
-			num_classes=args.num_classes,
+			model_name=self.args.model,
+			num_classes=self.args.num_classes,
 			model=model.cpu().state_dict(),
-			save_path=args.save_path,
+			save_path=self.args.save_path,
 		)
+
 		return result
 
 	def defense(self,result_file):

@@ -103,10 +103,6 @@ class MetaSiftDataset(Dataset):
 
 
 
-
-
-
-
 def batch_entropy(x, step_size=0.1):
 	n_bars = int((x.max()-x.min())/step_size)
 	entropy = 0
@@ -173,116 +169,179 @@ def evaluate_clean_acc(model, dataloader, criterion, device):
 
     return clean_acc, clean_loss
 
-def bnp_defense(net, u, trainloader, args):
-	clean_data_loader = trainloader['clean_train']
-	bd_data_loader = trainloader['bd_train']
-	net.eval()
-	bd_data = next(iter(bd_data_loader))[0].to(args.device)
-	mixture_data = next(iter(clean_data_loader))[0].to(args.device)
-	params = net.state_dict()
-	for m in net.modules():
-		if isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.LayerNorm):
-			m.collect_stats = True
-		if isinstance(m, nn.LayerNorm):
-			m.collect_stats_clean = True
-			m.collect_stats_bd = False
-	with torch.no_grad():
-		net(mixture_data)
+def collect_layer_kl_scores(net, trainloader, args):
+    """
+    Collect KL scores for each normalization layer once.
+    All candidate u vectors reuse these fixed scores.
+    """
+    clean_data_loader = trainloader['clean_train']
+    bd_data_loader = trainloader['bd_train']
 
-	# Save reference-data statistics before the next forward pass.
-	# Otherwise, bd_data may overwrite batch_mean and batch_var.
-	bn_clean_stats = {}
+    net.eval()
 
-	for name, m in net.named_modules():
-		if isinstance(m, nn.BatchNorm2d):
-			bn_clean_stats[name] = (
-				m.batch_mean.detach().clone(),
-				m.batch_var.detach().clone(),
-			)	
+    bd_data = next(iter(bd_data_loader))[0].to(args.device)
+    mixture_data = next(iter(clean_data_loader))[0].to(args.device)
+
+    for m in net.modules():
+        if isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.LayerNorm):
+            m.collect_stats = True
+
+        if isinstance(m, nn.LayerNorm):
+            m.collect_stats_clean = True
+            m.collect_stats_bd = False
+
+    # Collect clean-reference statistics
+    with torch.no_grad():
+        net(mixture_data)
+
+    bn_clean_stats = {}
+
+    for name, m in net.named_modules():
+        if isinstance(m, nn.BatchNorm2d):
+            bn_clean_stats[name] = (
+                m.batch_mean.detach().clone(),
+                m.batch_var.detach().clone(),
+            )
+
+    # Collect backdoor-training statistics
+    for m in net.modules():
+        if isinstance(m, nn.LayerNorm):
+            m.collect_stats_bd = True
+            m.collect_stats_clean = False
+
+    kl_scores = {}
+
+    with torch.no_grad():
+        net(bd_data)
+
+        for name, m in net.named_modules():
+
+            if isinstance(m, nn.BatchNorm2d):
+                mean_1, var_1 = bn_clean_stats[name]
+                mean_2 = m.running_mean
+                var_2 = m.running_var
+
+                eps = 1e-8
+                var_1 = var_1.clamp_min(eps)
+                var_2 = var_2.clamp_min(eps)
+
+                kl_div = (
+                    torch.log(var_2 / var_1)
+                    + (var_1 + (mean_1 - mean_2).pow(2))
+                    / (2 * var_2)
+                    - 0.5
+                )
+
+                kl_scores[name] = kl_div.detach().clone()
+
+            elif isinstance(m, nn.LayerNorm):
+                var_1 = m.batch_var_clean
+                var_2 = m.batch_var_bd
+                mean_1 = m.batch_mean_clean
+                mean_2 = m.batch_mean_bd
+
+                eps = 1e-8
+                var_1 = var_1.clamp_min(eps)
+                var_2 = var_2.clamp_min(eps)
+
+                kl_div = (
+                    0.5 * torch.log(var_2 / var_1)
+                    + (var_1 + (mean_1 - mean_2).pow(2))
+                    / (2 * var_2)
+                    - 0.5
+                )
+
+                kl_scores[name] = kl_div.detach().clone()
+
+    if len(kl_scores) == 0:
+        raise RuntimeError("No BatchNorm2d or LayerNorm KL scores were collected.")
+
+    logging.info(
+        f"Collected KL scores for {len(kl_scores)} normalization layers."
+    )
+
+    return kl_scores
 
 
-	for m in net.modules():
-		if isinstance(m, nn.LayerNorm):
-			m.collect_stats_bd = True
-			m.collect_stats_clean = False
-	with torch.no_grad():
-		net(bd_data)
-		for name, m in net.named_modules():
-			if isinstance(m, nn.BatchNorm2d):
-				mean_1, var_1 = bn_clean_stats[name]   # ← 干净参考统计
-				mean_2 = m.running_mean                 # ← BN 训练统计
-				var_2 = m.running_var
+def bnp_defense(net, u, kl_scores):
+    """
+    Apply Adaptive-A BNP pruning with layer-wise u values.
 
-				# Correct Gaussian KL divergence
-				eps = 1e-8
+    u:
+        Dictionary {layer_name: u_l}
 
-				var_1 = var_1.clamp_min(eps)
-				var_2 = var_2.clamp_min(eps)
-				kl_div = (var_2/var_1).log() + (var_1+(mean_1-mean_2).pow(2))/(2*var_2) - 1/2
+    kl_scores:
+        Pre-computed KL scores for each normalization layer.
+    """
+    params = net.state_dict()
+    pruning_stats = {}
 
-				# Adaptive-A: Median + k * MAD
-				threshold = adaptive_mad_threshold(kl_div, k=u)
+    for name, m in net.named_modules():
 
-				index = kl_div > threshold
+        if not (
+            isinstance(m, nn.BatchNorm2d)
+            or isinstance(m, nn.LayerNorm)
+        ):
+            continue
 
-				# Record pruning statistics
-				pruned_channels = int(index.sum().item())
-				total_channels = int(index.numel())
-				prune_ratio = pruned_channels / max(total_channels, 1)
+        if name not in kl_scores:
+            continue
 
-				logging.info(
-					f"[Adaptive-A] Layer: {name}, "
-					f"Threshold: {threshold.item():.6f}, "
-					f"Pruned: {pruned_channels}/{total_channels}, "
-					f"Ratio: {prune_ratio:.2%}"
-				)
+        # Get the individual u value for this layer
+        layer_u = u[name] if isinstance(u, dict) else u
 
-				params[name + '.weight'][index] = 0
-				params[name + '.bias'][index] = 0
+        kl_div = kl_scores[name].to(params[name + '.weight'].device)
 
-				# kl_div = (var_2/var_1).log() + (var_1+(mean_1-mean_2).pow(2))/(2*var_2) - 1/2
-				# index = (kl_div > kl_div.mean() + u * kl_div.std())
+        # Adaptive-A threshold for this individual layer
+        threshold = adaptive_mad_threshold(
+            kl_div,
+            k=float(layer_u)
+        )
 
-				# params[name+'.weight'][index] = 0
-				# params[name+'.bias'][index] = 0
-			elif isinstance(m, nn.LayerNorm):
-				# We use layer norm to subsitute batch norm in convnext_model and vit_model
-				var_2 = m.batch_var_bd
-				var_1 = m.batch_var_clean
-				mean_2 = m.batch_mean_bd
-				mean_1 = m.batch_mean_clean
+        index = kl_div > threshold
 
-				eps = 1e-8
+        pruned_channels = int(index.sum().item())
+        total_channels = int(index.numel())
+        prune_ratio = pruned_channels / max(total_channels, 1)
 
-				var_1 = var_1.clamp_min(eps)
-				var_2 = var_2.clamp_min(eps)
-				kl_div = 0.5 * torch.log(var_2 / var_1) + (var_1+(mean_1-mean_2).pow(2))/(2*var_2) - 1/2
-				# Adaptive-A: Median + k * MAD
-				threshold = adaptive_mad_threshold(kl_div, k=u)
+        # Apply the pruning mask
+        params[name + '.weight'][index] = 0
+        params[name + '.bias'][index] = 0
 
-				index = kl_div > threshold
+        pruning_stats[name] = {
+            "u": float(layer_u),
+            "threshold": float(threshold.item()),
+            "pruned_channels": pruned_channels,
+            "total_channels": total_channels,
+            "prune_ratio": prune_ratio,
+        }
 
-				pruned_channels = int(index.sum().item())
-				total_channels = int(index.numel())
-				prune_ratio = pruned_channels / max(total_channels, 1)
+        # logging.info(
+        #     f"[Adaptive-A] Layer: {name}, "
+        #     f"u: {layer_u:.4f}, "
+        #     f"Threshold: {threshold.item():.6f}, "
+        #     f"Pruned: {pruned_channels}/{total_channels}, "
+        #     f"Ratio: {prune_ratio:.2%}"
+        # )
 
-				logging.info(
-					f"[Adaptive-A] Layer: {name}, "
-					f"Threshold: {threshold.item():.6f}, "
-					f"Pruned: {pruned_channels}/{total_channels}, "
-					f"Ratio: {prune_ratio:.2%}"
-				)
+    net.load_state_dict(params)
 
-				params[name + '.weight'][index] = 0
-				params[name + '.bias'][index] = 0
+    total_pruned = sum(
+        item["pruned_channels"]
+        for item in pruning_stats.values()
+    )
 
-				# kl_div = 0.5 * torch.log(var_2 / var_1) + (var_1+(mean_1-mean_2).pow(2))/(2*var_2) - 1/2
-				# index = (kl_div>kl_div.mean() + u*kl_div.std())
+    total_channels = sum(
+        item["total_channels"]
+        for item in pruning_stats.values()
+    )
 
-				# params[name+'.weight'][index] = 0
-				# params[name+'.bias'][index] = 0
-
-	net.load_state_dict(params)
+    return {
+        "layers": pruning_stats,
+        "total_pruned": total_pruned,
+        "total_channels": total_channels,
+        "prune_ratio": total_pruned / max(total_channels, 1),
+    }
 
 def get_mbns_network(
 	model_name: str,
@@ -395,10 +454,10 @@ class bnp(defense):
 		parser.add_argument('--u_max', type=float, default=5.0, help='maximum u for search')
 		parser.add_argument('--u_num', type=int, default=41, help='number of candidate u values')
 
-		# ACC-constrained global search
-		parser.add_argument('--acc_drop_tolerance', type=float, default=0.015, help='maximum allowed ACC drop from clean validation baseline')
-		parser.add_argument('--val_ratio', type=float, default=0.2,	help='ratio of clean data used for validation')
-
+		# ACC-constrained layer-wise search
+		parser.add_argument('--acc_drop_tolerance',type=float,default=0.015,help='maximum allowed ACC drop from clean validation baseline')
+		parser.add_argument('--val_ratio',type=float, default=0.2, help='ratio of clean data used for validation')
+		parser.add_argument('--u_search_max_passes', type=int, default=2, help='maximum number of coordinate search passes')
 		parser.add_argument('--ratio', type=float, help='the ratio of clean data loader')
 		parser.add_argument('--index', type=str, help='index of clean data')
 
@@ -457,6 +516,7 @@ class bnp(defense):
 		# 	) if torch.cuda.is_available() else "cpu"
 		# )
 		self.device =self.args.device
+
 	def mitigation(self):
 		self.set_devices()
 		fix_random(self.args.random_seed)
@@ -474,7 +534,6 @@ class bnp(defense):
 			net.to(self.args.device)
 		else:
 			net.to(self.args.device)
-		# criterion = nn.CrossEntropyLoss()
 		
 		criterion = argparser_criterion(args)
 
@@ -486,37 +545,17 @@ class bnp(defense):
 		data_set_o = self.result['bd_train']
 		data_set_o.wrapped_dataset = data_set_without_tran
 		data_set_o.wrap_img_transform = train_tran
-		data_loader = torch.utils.data.DataLoader(data_set_o, batch_size=self.args.batch_size, num_workers=self.args.num_workers, shuffle=True, pin_memory=args.pin_memory)
+		data_loader = torch.utils.data.DataLoader(data_set_o, batch_size=self.args.batch_size, num_workers=self.args.num_workers, shuffle=True, pin_memory=self.args.pin_memory)
 		trainloader_backdoor = data_loader
 		trainloader_all['bd_train'] = trainloader_backdoor
 
 		bd_train = self.result['bd_train']
 		bd_wrapped = bd_train.wrapped_dataset
 
-		print("=== bd_train inspection ===")
-		print("Wrapper type:", type(bd_train))
-		print("Wrapped dataset type:", type(bd_wrapped))
-		print("Wrapped dataset length:", len(bd_wrapped))
-		print("Has targets:", hasattr(bd_wrapped, "targets"))
-		print("Has labels:", hasattr(bd_wrapped, "labels"))
-
-		sample = bd_wrapped[0]
-		print("Sample type:", type(sample))
-
-		if isinstance(sample, (tuple, list)):
-			print("Sample length:", len(sample))
-			for i, item in enumerate(sample):
-				if hasattr(item, "shape"):
-					print(f"Field {i} shape:", item.shape)
-				else:
-					print(f"Field {i}:", item)
-
-
 		# ==========================================
 		# 1. Obtain the full potentially poisoned dataset
 		# ==========================================
 		bd_wrapped = self.result['bd_train'].wrapped_dataset
-
 		print("Meta-Sift input size:", len(bd_wrapped))
 
 		# ==========================================
@@ -565,18 +604,14 @@ class bnp(defense):
 		)
 
 		clean_idx = np.asarray(clean_idx, dtype=np.int64)
-
 		print("Meta-Sift selected:", len(clean_idx))
 
-		# Save selected indices for reproducibility
 		log_index = self.args.log + 'index.txt'
 		np.savetxt(log_index, clean_idx, fmt='%d')
 
 		# ==========================================
 		# 5. Create an independent dataset copy
 		# ==========================================
-		# Do NOT modify the original bd_train wrapper,
-		# because trainloader_backdoor still uses it.
 		selected_bd_dataset = bd_wrapped.copy()
 		selected_bd_dataset.subset(clean_idx)
 
@@ -606,20 +641,15 @@ class bnp(defense):
 		trainloader_clean = data_loader
 		trainloader_all['clean_train'] = trainloader_clean
 
-
 		# ==========================================
 		# Prepare clean validation and final test sets
 		# ==========================================
-
 		test_tran = get_transform(self.args.dataset, self.args.input_height, self.args.input_width,	train=False)
 
-		# Backdoor test set: only used for final evaluation
 		data_bd_testset = self.result['bd_test']
 		data_bd_testset.wrap_img_transform = test_tran
-
 		data_bd_loader = torch.utils.data.DataLoader(data_bd_testset, batch_size=self.args.batch_size, num_workers=self.args.num_workers, drop_last=False,	pin_memory=self.args.pin_memory)
 
-		# Clean data: split into validation and final test
 		data_clean_all = self.result['clean_test']
 		data_clean_all.wrap_img_transform = test_tran
 
@@ -636,26 +666,31 @@ class bnp(defense):
 		clean_val_loader = torch.utils.data.DataLoader(clean_val_subset, batch_size=self.args.batch_size, shuffle=False, num_workers=self.args.num_workers,	pin_memory=self.args.pin_memory)
 		data_clean_loader = torch.utils.data.DataLoader(clean_test_subset,batch_size=self.args.batch_size,shuffle=False,num_workers=self.args.num_workers,pin_memory=self.args.pin_memory)
 
+		test_dataloader_dict = {"clean_test_dataloader": data_clean_loader, "bd_test_dataloader": data_bd_loader}
 		print(f"Clean validation samples: {val_size}")
 		print(f"Clean final test samples: {test_size}")
-		
-		# ==========================================
-		# ACC-Constrained Adaptive-A Global Search
-		# ==========================================
 
+		# ==========================================
+		# ACC-Constrained Layer-wise Coordinate Search
+		# ==========================================
 		default_u = np.linspace(
 			self.args.u_min,
 			self.args.u_max,
 			self.args.u_num
 		)
-
-		# Sort candidate u values from small to large
 		default_u = np.sort(default_u)
 
-		# ------------------------------------------
-		# 1. Evaluate the original unpruned model
-		# ------------------------------------------
+		# 1. Collect KL scores only once
+		kl_scores = collect_layer_kl_scores(
+			net,
+			trainloader_all,
+			self.args
+		)
 
+		layer_names = list(kl_scores.keys())
+		logging.info(f"Normalization layers for layer-wise search: {len(layer_names)}")
+
+		# 2. Evaluate the original unpruned model
 		baseline_model = copy.deepcopy(net)
 
 		baseline_acc, baseline_loss = evaluate_clean_acc(
@@ -667,189 +702,199 @@ class bnp(defense):
 
 		acc_min = baseline_acc - self.args.acc_drop_tolerance
 
-		print("\n========== ACC-Constrained Search ==========")
+		print("\n========== Layer-wise ACC-Constrained Search ==========")
 		print(f"Baseline Clean ACC: {baseline_acc:.4%}")
 		print(f"Baseline Clean Loss: {baseline_loss:.6f}")
 		print(f"Allowed ACC drop: {self.args.acc_drop_tolerance:.4%}")
 		print(f"Minimum required ACC: {acc_min:.4%}")
 
-		# ------------------------------------------
-		# 2. Search for the smallest feasible u
-		# ------------------------------------------
-
-		search_results = []
-
-		selected_u = None
-		selected_model = None
-
-		# 准备测试集的 dataloader 字典
-		test_dataloader_dict = {
-			"clean_test_dataloader": data_clean_loader,
-			"bd_test_dataloader": data_bd_loader
+		# 3. Initialize all layers with no pruning
+		selected_u_values = {
+			name: float('inf')
+			for name in layer_names
 		}
 
-		for u in default_u:
+		selected_model = copy.deepcopy(net)
+		selected_stats = {
+			"total_pruned": 0,
+			"total_channels": 0,
+			"prune_ratio": 0.0,
+			"layers": {}
+		}
+		search_results = []
 
-			print(f"\n========== Testing u = {u:.4f} ==========")
-
-			# Every candidate starts from the same original model
-			model_copy = copy.deepcopy(net)
-			model_copy.eval()
-
-			# Hard pruning using Adaptive-A
-			bnp_defense(
-				model_copy,
-				float(u),
-				trainloader_all,
-				self.args
-			)
-
-			# 1. Evaluate clean validation performance (用于判断 Feasible)
-			val_acc, val_loss = evaluate_clean_acc(
-				model_copy,
-				clean_val_loader,
-				criterion,
-				self.args.device
-			)
-
-			# Check ACC constraint
-			feasible = val_acc >= acc_min
-
-			# 2. Evaluate test set performance (用于记录和画图)
-			# 为了使用 trainer，先包装一下
-			self.set_trainer(model_copy)
-			self.trainer.set_with_dataloader(
-				train_dataloader=trainloader_backdoor,
-				test_dataloader_dict=test_dataloader_dict,
-				criterion=criterion,
-				optimizer=None,
-				scheduler=None,
-				device=self.args.device,
-				amp=self.args.amp,
-				frequency_save=self.args.frequency_save,
-				save_folder_path=self.args.save_path,
-				save_prefix='bnp',
-				prefetch=self.args.prefetch,
-				prefetch_transform_attr_name="ori_image_transform_in_loading",
-				non_blocking=self.args.non_blocking,
-			)
-			
-			clean_test_loss, bd_test_loss, test_acc, test_asr, test_ra = self.trainer.test_current_model(
-				test_dataloader_dict, self.args.device
-			)
-
-			search_results.append({
-				"u": float(u),
-				"clean_val_acc": val_acc,
-				"clean_val_loss": val_loss,
-				"test_acc": test_acc,
-				"test_asr": test_asr,
-				"test_ra": test_ra,
-				"acc_min": acc_min,
-				"feasible": feasible
-			})
-
-			print(f"Validation ACC: {val_acc:.4%} | Feasible: {feasible}")
-			
-			# ==========================================
-			# 这里是你要求的：把每个 u 的【测试集】指标打进日志！
-			# ==========================================
+		# 4. Layer-wise coordinate search
+		for search_pass in range(self.args.u_search_max_passes):
 			logging.info(
-				f"\n========== BNP Eval (Test Set): u={u:.4f} ==========\n"
-				f"Clean Loss: {clean_test_loss:.6f} | "
-				f"BD Loss: {bd_test_loss:.6f} | "
-				f"ACC: {test_acc:.4%} | "
-				f"ASR: {test_asr:.4%} | "
-				f"RA: {test_ra:.4%} | "
-				f"Val ACC: {val_acc:.4%} | "
-				f"Feasible: {feasible}"
+				f"\n========== Coordinate Search Pass "
+				f"{search_pass + 1}/{self.args.u_search_max_passes} =========="
 			)
+			pass_improved = False
+			for layer_name in layer_names:
+				logging.info(f"\n--- Optimizing layer: {layer_name} ---")
+				best_layer_u = selected_u_values[layer_name]
+				best_layer_model = copy.deepcopy(selected_model)
+				best_layer_stats = selected_stats
+				best_pruned = selected_stats["total_pruned"]
+				best_val_acc = evaluate_clean_acc(
+					selected_model,
+					clean_val_loader,
+					criterion,
+					self.args.device
+				)[0]
 
-			# Select the first feasible u.
-			if feasible and selected_model is None:
-				selected_u = float(u)
-				selected_model = copy.deepcopy(model_copy)
+				# Try each candidate u for the current layer.
+				for candidate_u in default_u:
+					candidate_u_values = selected_u_values.copy()
+					candidate_u_values[layer_name] = float(candidate_u)
 
-		# ------------------------------------------
-		# 3. Handle the case where no candidate works
-		# ------------------------------------------
+					candidate_model = copy.deepcopy(net)
+					candidate_model.eval()
 
-		if selected_model is None:
+					pruning_stats = bnp_defense(
+						candidate_model,
+						candidate_u_values,
+						kl_scores
+					)
 
-			print("\n[Warning] No candidate u satisfies the ACC constraint.")
-			print("Fallback: use the original unpruned model.")
+					val_acc, val_loss = evaluate_clean_acc(
+						candidate_model,
+						clean_val_loader,
+						criterion,
+						self.args.device
+					)
+					feasible = val_acc >= acc_min
+					total_pruned = pruning_stats["total_pruned"]
 
-			selected_u = None
-			selected_model = copy.deepcopy(net)
+					search_results.append({
+						"pass": search_pass + 1,
+						"layer": layer_name,
+						"candidate_u": float(candidate_u),
+						"clean_val_acc": val_acc,
+						"clean_val_loss": val_loss,
+						"total_pruned": total_pruned,
+						"total_channels": pruning_stats["total_channels"],
+						"prune_ratio": pruning_stats["prune_ratio"],
+						"acc_min": acc_min,
+						"feasible": feasible
+					})
 
-		else:
+					logging.info(
+						f"[Search] Layer: {layer_name}, "
+						f"u: {candidate_u:.2f}, "
+						f"ACC: {val_acc:.2%}, "
+						f"Pruned: {total_pruned}, "
+						f"Feasible: {feasible}"
+						)
 
-			print("\n========== Search Result ==========")
-			print(f"Selected u: {selected_u:.4f}")
+					if feasible and total_pruned > best_pruned:
+						best_pruned = total_pruned
+						best_layer_u = float(candidate_u)
+						best_layer_model = copy.deepcopy(candidate_model)
+						best_layer_stats = pruning_stats
+						best_val_acc = val_acc
 
-			selected_acc, selected_loss = evaluate_clean_acc(
-				selected_model,
-				clean_val_loader,
-				criterion,
-				self.args.device
-			)
+				if best_pruned > selected_stats["total_pruned"]:
+					selected_u_values[layer_name] = best_layer_u
+					selected_model = best_layer_model
+					selected_stats = best_layer_stats
+					pass_improved = True
+					logging.info(
+						f"[Layer Updated] {layer_name} | "
+						f"Best u: {best_layer_u:.4f} | "
+						f"Total Pruned: {best_pruned} | "
+						f"Val ACC: {best_val_acc:.4%}"
+						)
+					logging.info(
+						f"Updated {layer_name}: "
+						f"u = {best_layer_u:.4f}, "
+						f"Total pruned = {best_pruned}, "
+						f"Validation ACC = {best_val_acc:.4%}"
+					)
+				else:
+					print(
+						f"No improvement for {layer_name}. "
+						f"Keep u = {selected_u_values[layer_name]}"
+					)
 
-			print(f"Selected Validation ACC: {selected_acc:.4%}")
-			print(f"Selected Validation Loss: {selected_loss:.6f}")
+			if not pass_improved:
+				print("\nNo further improvement. Coordinate search stopped.")
+				break
 
-		# ------------------------------------------
-		# 4. Save search results
-		# ------------------------------------------
+		# 5. Final selected solution
+		selected_acc, selected_loss = evaluate_clean_acc(
+			selected_model,
+			clean_val_loader,
+			criterion,
+			self.args.device
+		)
 
+		print("\n========== Layer-wise Search Result ==========")
+		print(f"Selected Validation ACC: {selected_acc:.4%}")
+		print(f"Minimum Required ACC: {acc_min:.4%}")
+		print(f"Total Pruned Channels: {selected_stats['total_pruned']}")
+		print(f"Overall Pruning Ratio: {selected_stats['prune_ratio']:.4%}")
+
+		print("\nSelected layer-wise u values:")
+		for name, value in selected_u_values.items():
+			print(f"{name}: {value}")
+
+		logging.info(
+			f"Selected Validation ACC: {selected_acc:.4%}, "
+			f"ACC Constraint: {acc_min:.4%}, "
+			f"Total Pruned: {selected_stats['total_pruned']}, "
+			f"Pruning Ratio: {selected_stats['prune_ratio']:.4%}"
+		)
+
+		# 6. Save search results
 		import pandas as pd
+		import json
 
 		search_df = pd.DataFrame(search_results)
-
 		search_df.to_csv(
-			f"{self.args.save_path}acc_constrained_search.csv",
+			f"{self.args.save_path}layer_wise_search.csv",
 			index=False
 		)
 
-		print(
-			f"Search results saved to: "
-			f"{self.args.save_path}acc_constrained_search.csv"
-		)
+		# 处理 inf 避免 json 报错
+		saved_u_values = {
+			name: (value if np.isfinite(value) else "inf")
+			for name, value in selected_u_values.items()
+		}
+
+		with open(
+			f"{self.args.save_path}selected_layer_u.json",
+			"w"
+		) as f:
+			json.dump(saved_u_values, f, indent=4)
+
+		print(f"Search results saved to: {self.args.save_path}layer_wise_search.csv")
+		print(f"Selected u values saved to: {self.args.save_path}selected_layer_u.json")
 
 		# ==========================================
 		# Final evaluation using selected model
 		# ==========================================
-
-		agg = Metric_Aggregator()
-
-		# Use the selected model directly.
-		# Do NOT apply BNP again.
 		selected_model.eval()
 
-		# Convert MBNS model to the standard model structure
 		model = generate_cls_model(
 			self.args.model,
 			self.args.num_classes
 		)
-
 		model.load_state_dict(selected_model.state_dict())
 		model.to(self.args.device)
 
 		self.set_trainer(model)
-
 		self.trainer.set_with_dataloader(
 			train_dataloader=trainloader_backdoor,
 			test_dataloader_dict=test_dataloader_dict,
-
 			criterion=criterion,
 			optimizer=None,
 			scheduler=None,
 			device=self.args.device,
 			amp=self.args.amp,
-
 			frequency_save=self.args.frequency_save,
 			save_folder_path=self.args.save_path,
 			save_prefix='bnp',
-
 			prefetch=self.args.prefetch,
 			prefetch_transform_attr_name="ori_image_transform_in_loading",
 			non_blocking=self.args.non_blocking,
@@ -865,29 +910,16 @@ class bnp(defense):
 			self.args.device
 		)
 
-		# 这里修复了原来的 bug，将 u 改成了 selected_u
 		logging.info(
-			f"\n========== Final Selected Model: u={selected_u if selected_u is not None else -1} ==========\n"
+			f"\n========== Final Selected Layer-wise Model ==========\n"
+			f"Selected u values: {saved_u_values}\n"
 			f"Clean ACC: {test_acc:.4%} | "
 			f"ASR: {test_asr:.4%} | "
 			f"RA: {test_ra:.4%} | "
 			f"Clean Loss: {clean_test_loss_avg_over_batch:.6f} | "
 			f"BD Loss: {bd_test_loss_avg_over_batch:.6f}"
-		)		
+		)	
 
-		agg({
-			"selected_u": selected_u if selected_u is not None else -1,
-			"clean_test_loss_avg_over_batch": clean_test_loss_avg_over_batch,
-			"bd_test_loss_avg_over_batch": bd_test_loss_avg_over_batch,
-			"test_acc": test_acc,
-			"test_asr": test_asr,
-			"test_ra": test_ra,
-		})
-
-		agg.to_dataframe().to_csv(
-			f"{self.args.save_path}bnp_df_summary.csv",
-			index=False
-		)
 
 		# Save selected model
 		result = {}
