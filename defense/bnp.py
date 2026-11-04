@@ -455,7 +455,7 @@ class bnp(defense):
 		parser.add_argument('--u_num', type=int, default=41, help='number of candidate u values')
 
 		# ACC-constrained layer-wise search
-		parser.add_argument('--acc_drop_tolerance',type=float,default=0.015,help='maximum allowed ACC drop from clean validation baseline')
+		parser.add_argument('--acc_drop_tolerance',type=float,default=0.02,help='maximum allowed ACC drop from clean validation baseline')
 		parser.add_argument('--val_ratio',type=float, default=0.2, help='ratio of clean data used for validation')
 		parser.add_argument('--u_search_max_passes', type=int, default=2, help='maximum number of coordinate search passes')
 		parser.add_argument('--ratio', type=float, help='the ratio of clean data loader')
@@ -535,7 +535,7 @@ class bnp(defense):
 		else:
 			net.to(self.args.device)
 		
-		criterion = argparser_criterion(args)
+		criterion = argparser_criterion(self.args)
 
 		trainloader_all = {}
 
@@ -595,12 +595,14 @@ class bnp(defense):
 		# ==========================================
 		# 4. Select a small candidate-clean subset
 		# ==========================================
-		total_pick = 2500  # Change to 1000 if needed
+		total_pick = 5000  # Change to 1000 if needed
 
 		clean_idx = meta_sift(
 			meta_args,
 			meta_dataset,
-			total_pick=total_pick
+			total_pick=total_pick,
+			coarse_ratio=0.5,
+			coarse_sifter_ratio=0.4,
 		)
 
 		clean_idx = np.asarray(clean_idx, dtype=np.int64)

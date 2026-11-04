@@ -47,7 +47,7 @@ def train_sifter(args, dataset):
         grad_models, grad_optimizers = build_grad_models(args, model)
         model, optimizer_a = warmup(model, optimizer_a, train_dataloader, args)
         raw_meta_model = ResNet18(num_classes = args.num_classes).cuda()
-        for i in range(args.res_epochs):
+        for epoch in range(args.res_epochs):
             train_iter = tqdm(enumerate(train_dataloader), total=int(len(dataset)/args.batch_size)+1)
             for iteration, (input_train, target_train) in train_iter:
                 input_var,target_var = input_train.cuda(), target_train.cuda()
@@ -159,14 +159,267 @@ def get_sifter_result(args, dataset, v_res, total_pick = 1000):
     new_idx = np.array(new_idx)
     return new_idx
 
-def meta_sift(args, dataset, total_pick=1000):
+class MetaSiftSubset(Dataset):
+    """
+    根据原始数据集索引构造子集。
+
+    indices 是相对于传入 dataset 的索引。
+    子集保留 targets、labels 等属性，并将 transform 操作转发到底层数据集。
+    """
+
+    def __init__(self, dataset, indices):
+        self.dataset = dataset
+        self.indices = np.asarray(indices, dtype=np.int64)
+
+        if hasattr(dataset, "targets"):
+            self.targets = [
+                dataset.targets[int(i)] for i in self.indices
+            ]
+
+        if hasattr(dataset, "labels"):
+            self.labels = [
+                dataset.labels[int(i)] for i in self.indices
+            ]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        original_index = int(self.indices[index])
+        return self.dataset[original_index]
+
+    def __getattr__(self, name):
+        # 防止 deepcopy 初始化过程中发生递归调用
+        if name in {"dataset", "indices"}:
+            raise AttributeError(name)
+
+        dataset = self.__dict__.get("dataset", None)
+        if dataset is None:
+            raise AttributeError(name)
+
+        return getattr(dataset, name)
+
+    def __setattr__(self, name, value):
+        # transform 修改需要作用于底层数据集
+        if name == "transform" and "dataset" in self.__dict__:
+            setattr(self.dataset, name, value)
+        else:
+            object.__setattr__(self, name, value)
+
+
+def _meta_sift_single(args, dataset, total_pick=1000):
+    """
+    执行一次完整的 Meta-Sift 筛选。
+
+    输入：
+        args
+        dataset
+        total_pick
+
+    输出：
+        相对于当前 dataset 的样本索引。
+    """
+
     set_seed(args.random_seed)
+
     test_poi_set = copy.deepcopy(dataset)
+
     test_poi_set.transform = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomRotation(25),
         transforms.ToTensor(),
     ])
+
     vnet_list, mnet_list = train_sifter(args, dataset)
-    v_res = test_sifter(args, test_poi_set, vnet_list, mnet_list)
-    return get_sifter_result(args, test_poi_set, v_res, total_pick)
+
+    v_res = test_sifter(
+        args,
+        test_poi_set,
+        vnet_list,
+        mnet_list
+    )
+
+    selected_indices = get_sifter_result(
+        args,
+        test_poi_set,
+        v_res,
+        total_pick=total_pick
+    )
+
+    return np.asarray(selected_indices, dtype=np.int64).reshape(-1)
+
+
+def meta_sift(
+    args,
+    dataset,
+    total_pick=1000,
+    coarse_ratio=0.5,
+    coarse_sifter_ratio=0.5,
+):
+    """
+    Two-stage Lightweight Meta-Sift.
+
+    Stage 1: Coarse screening
+        在完整数据集上进行初步筛选，得到候选样本集。
+
+    Stage 2: Fine screening
+        在候选样本集上重新训练 Sifter，并筛选最终样本。
+
+    Args:
+        args:
+            原始 Meta-Sift 参数。
+        dataset:
+            输入数据集，例如 BackdoorBench 中的 bd_train。
+        total_pick:
+            最终需要筛选的样本数量。
+        coarse_ratio:
+            第一阶段候选样本数量占原始数据集的比例。
+            例如 0.2 表示保留约 20%。
+        coarse_sifter_ratio:
+            第一阶段使用的 Sifter 数量占 args.num_sifter 的比例。
+            例如 0.5 表示使用一半的 Sifter。
+
+    Returns:
+        final_indices:
+            np.ndarray，最终样本在原始输入 dataset 中的索引。
+    """
+
+    dataset_size = len(dataset)
+
+    # ---------------------------------
+    # Parameter validation
+    # ---------------------------------
+
+    if total_pick <= 0 or total_pick > dataset_size:
+        raise ValueError(
+            f"total_pick must be in [1, {dataset_size}], "
+            f"got {total_pick}"
+        )
+
+    if not 0 < coarse_ratio <= 1:
+        raise ValueError(
+            f"coarse_ratio must be in (0, 1], got {coarse_ratio}"
+        )
+
+    if not 0 < coarse_sifter_ratio <= 1:
+        raise ValueError(
+            "coarse_sifter_ratio must be in (0, 1], "
+            f"got {coarse_sifter_ratio}"
+        )
+
+    if args.num_sifter <= 0:
+        raise ValueError(
+            f"args.num_sifter must be positive, got {args.num_sifter}"
+        )
+
+    # ---------------------------------
+    # Stage 1: Coarse screening
+    # ---------------------------------
+
+    coarse_args = copy.deepcopy(args)
+
+    # 第一阶段使用较少的 Sifter
+    coarse_args.num_sifter = max(
+        1,
+        math.ceil(args.num_sifter * coarse_sifter_ratio)
+    )
+
+    # 第一阶段候选样本数量
+    # 至少需要保留 total_pick 个样本
+    coarse_pick = max(
+        total_pick,
+        math.ceil(dataset_size * coarse_ratio)
+    )
+
+    coarse_pick = min(coarse_pick, dataset_size)
+
+    print("\n========== Meta-Sift Coarse Stage ==========")
+    print(f"Original dataset size: {dataset_size}")
+    print(f"Coarse candidate ratio: {coarse_ratio}")
+    print(f"Coarse candidate count: {coarse_pick}")
+    print(
+        f"Coarse num_sifter: "
+        f"{coarse_args.num_sifter}/{args.num_sifter}"
+    )
+
+    # 在完整数据集上执行第一次筛选
+    coarse_indices = _meta_sift_single(
+        coarse_args,
+        dataset,
+        total_pick=coarse_pick
+    )
+
+    coarse_indices = np.asarray(
+        coarse_indices,
+        dtype=np.int64
+    ).reshape(-1)
+
+    # 检查第一阶段结果
+    if len(coarse_indices) < total_pick:
+        raise RuntimeError(
+            f"Coarse screening returned only {len(coarse_indices)} "
+            f"samples, fewer than total_pick={total_pick}."
+        )
+
+    if np.any(coarse_indices < 0) or np.any(coarse_indices >= dataset_size):
+        raise IndexError(
+            "Coarse screening returned indices outside the original dataset."
+        )
+
+    print(
+        f"Coarse screening finished: "
+        f"{len(coarse_indices)} candidates selected."
+    )
+
+    # ---------------------------------
+    # Stage 2: Fine screening
+    # ---------------------------------
+
+    print("\n========== Meta-Sift Fine Stage ==========")
+    print(f"Fine num_sifter: {args.num_sifter}")
+    print(f"Fine input count: {len(coarse_indices)}")
+    print(f"Final target count: {total_pick}")
+
+    # 根据第一阶段索引构造候选数据集
+    candidate_dataset = MetaSiftSubset(
+        dataset,
+        coarse_indices
+    )
+
+    # 第二阶段使用原始 args.num_sifter
+    # 并在候选数据集上重新执行 Meta-Sift
+    fine_local_indices = _meta_sift_single(
+        args,
+        candidate_dataset,
+        total_pick=total_pick
+    )
+
+    fine_local_indices = np.asarray(
+        fine_local_indices,
+        dtype=np.int64
+    ).reshape(-1)
+
+    # 检查第二阶段索引
+    if np.any(fine_local_indices < 0) or np.any(
+        fine_local_indices >= len(coarse_indices)
+    ):
+        raise IndexError(
+            "Fine screening returned indices outside the candidate dataset."
+        )
+
+    # ---------------------------------
+    # Map indices back to original dataset
+    # ---------------------------------
+
+    final_indices = coarse_indices[fine_local_indices]
+
+    final_indices = np.asarray(
+        final_indices,
+        dtype=np.int64
+    ).reshape(-1)
+
+    print("\n========== Meta-Sift Finished ==========")
+    print(f"Final selected count: {len(final_indices)}")
+    print(f"Requested count: {total_pick}")
+
+    return final_indices

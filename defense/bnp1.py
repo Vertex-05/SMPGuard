@@ -396,12 +396,11 @@ class bnp(defense):
 		parser.add_argument('--u_num', type=int, default=41, help='number of candidate u values')
 
 		# ACC-constrained global search
-		parser.add_argument('--acc_drop_tolerance', type=float, default=0.015, help='maximum allowed ACC drop from clean validation baseline')
+		parser.add_argument('--acc_drop_tolerance', type=float, default=0.02, help='maximum allowed ACC drop from clean validation baseline')
 		parser.add_argument('--val_ratio', type=float, default=0.2,	help='ratio of clean data used for validation')
 
 		parser.add_argument('--ratio', type=float, help='the ratio of clean data loader')
 		parser.add_argument('--index', type=str, help='index of clean data')
-
 
 	def set_result(self, result_file):
 		attack_file = 'record/' + result_file
@@ -476,7 +475,7 @@ class bnp(defense):
 			net.to(self.args.device)
 		# criterion = nn.CrossEntropyLoss()
 		
-		criterion = argparser_criterion(args)
+		criterion = argparser_criterion(self.args)
 
 		trainloader_all = {}
 
@@ -486,7 +485,7 @@ class bnp(defense):
 		data_set_o = self.result['bd_train']
 		data_set_o.wrapped_dataset = data_set_without_tran
 		data_set_o.wrap_img_transform = train_tran
-		data_loader = torch.utils.data.DataLoader(data_set_o, batch_size=self.args.batch_size, num_workers=self.args.num_workers, shuffle=True, pin_memory=args.pin_memory)
+		data_loader = torch.utils.data.DataLoader(data_set_o, batch_size=self.args.batch_size, num_workers=self.args.num_workers, shuffle=True, pin_memory=self.args.pin_memory)
 		trainloader_backdoor = data_loader
 		trainloader_all['bd_train'] = trainloader_backdoor
 
@@ -556,12 +555,14 @@ class bnp(defense):
 		# ==========================================
 		# 4. Select a small candidate-clean subset
 		# ==========================================
-		total_pick = 2500  # Change to 1000 if needed
+		total_pick = 5000  # Change to 1000 if needed
 
 		clean_idx = meta_sift(
 			meta_args,
 			meta_dataset,
 			total_pick=total_pick
+			# coarse_ratio=0.5,
+			# coarse_sifter_ratio=0.4,
 		)
 
 		clean_idx = np.asarray(clean_idx, dtype=np.int64)
@@ -824,6 +825,11 @@ class bnp(defense):
 		# Use the selected model directly.
 		# Do NOT apply BNP again.
 		selected_model.eval()
+
+		test_dataloader_dict = {
+			"clean_test_dataloader": data_clean_loader,
+			"bd_test_dataloader": data_bd_loader,
+		}
 
 		# Convert MBNS model to the standard model structure
 		model = generate_cls_model(
